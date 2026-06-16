@@ -1,0 +1,552 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+using Dapper;
+using Microsoft.Extensions.Logging;
+using MySqlConnector;
+
+namespace SyncConsole
+{
+    public record SyncResult(int Inserts, int Updates, int Deletes, int Conflicts);
+
+    public sealed class SyncEngine
+    {
+        private readonly string _centralDb;
+        private readonly string _shipDb;
+        private readonly string _domain;
+        private readonly string _shipImo;
+        private readonly string _direction;
+        private readonly string _env;
+        private readonly int _batch;
+        private readonly MySqlConnection _conn;
+        private readonly ILogger _log;
+
+        // ═══════════════════════════════════════════════════════════════════
+        // CONNECTION HEALTH - Periodic checks to prevent timeout disconnects
+        // ═══════════════════════════════════════════════════════════════════
+        private const int CONNECTION_CHECK_INTERVAL = 10;  // Check every N tables
+        private int _tablesSinceLastCheck = 0;
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Thread-safe SHA256 for hashing (reused across calls for performance)
+        // ═══════════════════════════════════════════════════════════════════
+        private static readonly SHA256 _sha256 = SHA256.Create();
+        private static readonly object _shaLock = new();
+
+        public SyncEngine(
+            (string CentralDb, string ShipDb) dbs,
+            string domain,
+            string shipImo,
+            string direction,
+            string environment,
+            int batch,
+            MySqlConnection conn,
+            ILogger log)
+        {
+            _centralDb = dbs.CentralDb;
+            _shipDb = dbs.ShipDb;
+            _domain = domain;
+            _shipImo = shipImo;
+            _direction = direction?.ToLowerInvariant() ?? "ship_to_online";
+            _env = environment?.ToLowerInvariant() ?? "online";
+            _batch = batch;
+            _conn = conn;
+            _log = log;
+        }
+
+        /// <summary>
+        /// Source database (where data comes FROM)
+        /// ship_to_online: source = ship
+        /// online_to_ship: source = central
+        /// </summary>
+        private string SourceDb => _direction == "ship_to_online" ? _shipDb : _centralDb;
+
+        /// <summary>
+        /// Target database (where data goes TO, and where conflicts are resolved in favor of)
+        /// ship_to_online: target = central (online wins)
+        /// online_to_ship: target = ship
+        /// </summary>
+        private string TargetDb => _direction == "ship_to_online" ? _centralDb : _shipDb;
+
+        /// <summary>
+        /// Ensure connection is healthy, reconnect if needed
+        /// </summary>
+        private async Task EnsureConnectionHealthAsync()
+        {
+            _tablesSinceLastCheck++;
+
+            if (_tablesSinceLastCheck >= CONNECTION_CHECK_INTERVAL)
+            {
+                _tablesSinceLastCheck = 0;
+                await Db.EnsureConnectionAsync(_conn, _log);
+            }
+        }
+
+        /// <summary>
+        /// Main sync method for a single table
+        /// </summary>
+        public async Task<SyncResult> SyncTableAsync(string table)
+        {
+            int inserted = 0, updated = 0, deleted = 0, conflicts = 0;
+
+            // ══════════════════════════════════════════════════════════════
+            // Periodic connection health check
+            // ══════════════════════════════════════════════════════════════
+            await EnsureConnectionHealthAsync();
+
+            // ══════════════════════════════════════════════════════════════
+            // CHECK TABLE EXISTS IN BOTH DATABASES
+            // Skip sync if table doesn't exist in either source or target
+            // ══════════════════════════════════════════════════════════════
+            bool existsInSource = await TableExistsAsync(SourceDb, table);
+            bool existsInTarget = await TableExistsAsync(TargetDb, table);
+
+            if (!existsInSource && !existsInTarget)
+            {
+                _log.LogWarning("Skipping {Table}: table doesn't exist in either database.", table);
+                return new SyncResult(inserted, updated, deleted, conflicts);
+            }
+
+            if (!existsInSource)
+            {
+                _log.LogWarning("Skipping {Table}: table doesn't exist in source database ({Db}).", table, SourceDb);
+                return new SyncResult(inserted, updated, deleted, conflicts);
+            }
+
+            if (!existsInTarget)
+            {
+                _log.LogWarning("Skipping {Table}: table doesn't exist in target database ({Db}).", table, TargetDb);
+                return new SyncResult(inserted, updated, deleted, conflicts);
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // Generate batch ID ONCE per table sync (not per column)
+            // Format: console_YYYYMMDD_HHmmss_fff (27 chars, fits VARCHAR(64))
+            // ══════════════════════════════════════════════════════════════
+            string syncBatchId = $"console_{DateTime.UtcNow:yyyyMMdd_HHmmss_fff}";
+
+            // ──────────────────────────────────────────────────────────────
+            // 1) Load table metadata
+            // ──────────────────────────────────────────────────────────────
+            var meta = await Db.GetTableMetaAsync(_conn, table, TargetDb);
+            if (meta is null || string.IsNullOrWhiteSpace(meta.Pk))
+            {
+                _log.LogWarning("Skipping {Table}: metadata not found or PK missing in {Db}.", table, TargetDb);
+                return new SyncResult(inserted, updated, deleted, conflicts);
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // SHIP DB COLUMN PREFERENCE
+            // Only sync columns that exist in Ship DB (offline database)
+            // This ensures Ship DB schema is the master for column selection
+            // Works for both directions: ship_to_online and online_to_ship
+            // ══════════════════════════════════════════════════════════════
+            var shipDbColumns = await Db.GetTableColumnsAsync(_conn, _shipDb, table);
+            var filteredColumns = meta.CompareColumns
+                .Where(col => shipDbColumns.Contains(col))
+                .ToList();
+
+            if (filteredColumns.Count == 0)
+            {
+                _log.LogWarning("Skipping {Table}: no matching columns found in Ship DB ({Db}).", table, _shipDb);
+                return new SyncResult(inserted, updated, deleted, conflicts);
+            }
+
+            if (filteredColumns.Count < meta.CompareColumns.Count)
+            {
+                var skippedCols = meta.CompareColumns.Except(filteredColumns).ToList();
+                _log.LogDebug("Table {Table}: Skipping {Count} columns not in Ship DB: {Cols}",
+                    table, skippedCols.Count, string.Join(", ", skippedCols));
+            }
+
+            // Replace meta columns with filtered columns (Ship DB preference)
+            meta = meta with { CompareColumns = filteredColumns };
+
+            _log.LogDebug("Table {Table}: PK={Pk}, comparing {Count} columns (Ship DB filtered)",
+                table, meta.Pk, meta.CompareColumns.Count);
+
+            // ──────────────────────────────────────────────────────────────
+            // 2) Insert rows that exist only on source
+            // Uses only columns that exist in Ship DB to avoid column mismatch errors
+            // ──────────────────────────────────────────────────────────────
+            try
+            {
+                // Build column list: PK + filtered columns that exist in Ship DB
+                var insertColumns = new List<string> { meta.Pk };
+                insertColumns.AddRange(filteredColumns);
+
+                // Also include system columns if they exist in Ship DB (for proper timestamps)
+                var systemColsInShip = shipDbColumns
+                    .Where(c => !insertColumns.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+                insertColumns.AddRange(systemColsInShip);
+
+                var colList = string.Join(", ", insertColumns.Select(c => $"`{c}`"));
+
+                var insertSql = $@"
+INSERT INTO `{TargetDb}`.`{table}` ({colList})
+SELECT {colList} FROM `{SourceDb}`.`{table}` s
+LEFT JOIN `{TargetDb}`.`{table}` t ON t.`{meta.Pk}` = s.`{meta.Pk}`
+WHERE t.`{meta.Pk}` IS NULL;";
+                inserted += await _conn.ExecuteAsync(insertSql);
+
+                if (inserted > 0)
+                    _log.LogDebug("Inserted {Count} new rows into {Table}", inserted, table);
+            }
+            catch (MySqlException ex)
+            {
+                _log.LogWarning("Insert failed for {Table}: {Error}", table, ex.Message);
+                // Continue with update/merge even if insert fails
+            }
+
+            // ──────────────────────────────────────────────────────────────
+            // 3) Compare/merge rows in batches
+            // ──────────────────────────────────────────────────────────────
+            var countPairsSql = $@"
+SELECT COUNT(*) FROM `{TargetDb}`.`{table}` t
+JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
+            var totalPairs = await _conn.ExecuteScalarAsync<int>(countPairsSql);
+
+            var processed = 0;
+
+            while (processed < totalPairs)
+            {
+                PrintProgress(processed, totalPairs, "  • Compare/merge");
+
+                var pks = await Db.ReadBatchKeysAsync(_conn, TargetDb, SourceDb, table, meta.Pk, processed, _batch);
+                if (pks.Count == 0) break;
+
+                foreach (var col in meta.CompareColumns)
+                {
+                    var triples = await Db.LoadValueTriplesAsync(
+                        _conn, TargetDb, SourceDb, table, meta.Pk, pks, col, meta.UpdatedCol);
+                    var shadow = await Db.LoadShadowMapAsync(_conn, table, col, pks);
+
+                    var toShadow = new List<(string pk, string hash)>();
+                    var toUpdate = new List<(string pk, object? val)>();
+                    var conflictRows = new List<ConflictRecord>();
+
+                    foreach (var kv in triples)
+                    {
+                        var pk = kv.Key;
+                        var (tval, sval, tts, sts) = kv.Value;
+
+                        // Get baseline hash from shadow, or compute from "winner" side if no shadow exists
+                        string baselineHash = shadow.TryGetValue(pk, out var h)
+                            ? h
+                            : HashValue(_direction == "ship_to_online" ? tval : sval);
+
+                        var tHash = HashValue(tval);
+                        var sHash = HashValue(sval);
+
+                        bool changedTarget = tHash != baselineHash;
+                        bool changedSource = sHash != baselineHash;
+
+                        // ════════════════════════════════════════════════════════
+                        // DECISION MATRIX
+                        // ════════════════════════════════════════════════════════
+
+                        // Case 1: No change anywhere → just refresh shadow
+                        if (!changedTarget && !changedSource)
+                        {
+                            toShadow.Add((pk, tHash));
+                            continue;
+                        }
+
+                        // Case 2: Only source changed → apply source to target
+                        if (!changedTarget && changedSource)
+                        {
+                            toUpdate.Add((pk, sval));
+                            toShadow.Add((pk, sHash));
+                            continue;
+                        }
+
+                        // Case 3: Only target changed → keep target, update shadow
+                        if (changedTarget && !changedSource)
+                        {
+                            toShadow.Add((pk, tHash));
+                            continue;
+                        }
+
+                        // Case 4: Both changed to SAME value → no conflict, accept
+                        if (tHash == sHash)
+                        {
+                            toShadow.Add((pk, tHash));
+                            continue;
+                        }
+
+                        // ════════════════════════════════════════════════════════
+                        // Case 5: TRUE CONFLICT - Both sides changed to DIFFERENT values
+                        // ════════════════════════════════════════════════════════
+                        conflicts++;
+
+                        // Online always wins:
+                        // - ship_to_online: target=online, so chosen=tval
+                        // - online_to_ship: source=online, so chosen=sval
+                        object? chosen = (_direction == "ship_to_online") ? tval : sval;
+                        var chosenHash = HashValue(chosen);
+
+                        // Record conflict for logging
+                        conflictRows.Add(new ConflictRecord(pk, tval, sval, chosen));
+
+                        // Only update target if chosen differs from current target
+                        if (chosenHash != tHash)
+                            toUpdate.Add((pk, chosen));
+
+                        toShadow.Add((pk, chosenHash));
+                    }
+
+                    // ──────────────────────────────────────────────────────────
+                    // Apply updates to target
+                    // ──────────────────────────────────────────────────────────
+                    if (toUpdate.Count > 0)
+                    {
+                        var updSql = $@"
+UPDATE `{TargetDb}`.`{table}`
+SET `{col}`=@val
+WHERE `{meta.Pk}`=@pk AND NOT (`{col}` <=> @val);";
+
+                        foreach (var u in toUpdate)
+                        {
+                            try
+                            {
+                                var rowsAffected = await _conn.ExecuteAsync(updSql, new { pk = u.pk, val = u.val });
+                                if (rowsAffected > 0)
+                                    updated++;
+                            }
+                            catch (MySqlException ex)
+                            {
+                                _log.LogWarning("Update failed for {Table}.{Col} pk={Pk}: {Error}",
+                                    table, col, u.pk, ex.Message);
+                            }
+                        }
+                    }
+
+                    // ──────────────────────────────────────────────────────────
+                    // Log conflicts to database
+                    // ──────────────────────────────────────────────────────────
+                    if (conflictRows.Count > 0)
+                    {
+                        await LogConflictsAsync(conflictRows, table, col, syncBatchId);
+                    }
+
+                    // ──────────────────────────────────────────────────────────
+                    // Refresh shadow table
+                    // ──────────────────────────────────────────────────────────
+                    if (toShadow.Count > 0)
+                    {
+                        await Db.UpsertShadowAsync(_conn, table, col, toShadow, _log);
+                    }
+                }
+
+                processed += pks.Count;
+            }
+
+            PrintProgress(totalPairs, totalPairs, "");
+            Console.WriteLine();
+            _log.LogInformation("✔ {Table}: ins={Ins} upd={Upd} del={Del} conf={Conf}",
+                table, inserted, updated, deleted, conflicts);
+
+            // ──────────────────────────────────────────────────────────────
+            // 4) Soft delete propagation
+            // ──────────────────────────────────────────────────────────────
+            if (meta.HasDeleted)
+            {
+                try
+                {
+                    var localDelCol = await Db.GetDeletedFlagColumnAsync(_conn, TargetDb, table);
+                    var sourceDelCol = await Db.GetDeletedFlagColumnAsync(_conn, SourceDb, table);
+
+                    if (!string.IsNullOrEmpty(localDelCol) && !string.IsNullOrEmpty(sourceDelCol))
+                    {
+                        var sqlDel = $@"
+UPDATE `{TargetDb}`.`{table}` t
+JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`
+SET t.`{localDelCol}` = 1
+WHERE COALESCE(s.`{sourceDelCol}`, 0) = 1
+  AND COALESCE(t.`{localDelCol}`, 0) = 0;";
+
+                        var delCount = await _conn.ExecuteAsync(sqlDel);
+                        deleted += delCount;
+
+                        if (delCount > 0)
+                            _log.LogDebug("Propagated {Count} soft deletes for {Table}", delCount, table);
+                    }
+                }
+                catch (MySqlException ex)
+                {
+                    _log.LogWarning("Soft delete propagation failed for {Table}: {Error}", table, ex.Message);
+                }
+            }
+
+            return new SyncResult(inserted, updated, deleted, conflicts);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // TABLE EXISTENCE CHECK
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Check if a table exists in the specified database
+        /// </summary>
+        private async Task<bool> TableExistsAsync(string database, string table)
+        {
+            try
+            {
+                var sql = @"
+SELECT COUNT(*) FROM information_schema.TABLES 
+WHERE TABLE_SCHEMA = @db AND TABLE_NAME = @tbl;";
+                var count = await _conn.ExecuteScalarAsync<int>(sql, new { db = database, tbl = table });
+                return count > 0;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("Error checking table existence for {Db}.{Table}: {Error}", database, table, ex.Message);
+                return false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // HASHING
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Compute SHA-256 hash of a value for shadow comparison
+        /// Thread-safe, handles all common MySQL types
+        /// </summary>
+        private static string HashValue(object? v)
+        {
+            string s = v switch
+            {
+                null or DBNull => "<NULL>",
+                DateTime dt => dt.ToUniversalTime().ToString("O"),
+                DateTimeOffset dto => dto.UtcDateTime.ToString("O"),
+                byte[] bytes => Convert.ToBase64String(bytes),
+                bool b => b ? "true" : "false",
+                decimal d => d.ToString(CultureInfo.InvariantCulture),
+                float f => f.ToString("G9", CultureInfo.InvariantCulture),
+                double dbl => dbl.ToString("G17", CultureInfo.InvariantCulture),
+                _ => Convert.ToString(v, CultureInfo.InvariantCulture) ?? ""
+            };
+
+            lock (_shaLock)
+            {
+                return Convert.ToBase64String(_sha256.ComputeHash(Encoding.UTF8.GetBytes(s)));
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // CONFLICT LOGGING
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Internal record for conflict data
+        /// </summary>
+        private record ConflictRecord(string Pk, object? TargetValue, object? SourceValue, object? ChosenValue);
+
+        /// <summary>
+        /// Log conflicts to sails_master.sync_conflict_log_columns
+        /// Uses existing connection (_conn), properly handles all types
+        /// </summary>
+        private async Task LogConflictsAsync(
+            List<ConflictRecord> rows,
+            string table,
+            string column,
+            string batchId)
+        {
+            const string sql = @"
+INSERT INTO sails_master.sync_conflict_log_columns
+(sync_batch_id, table_name, record_pk, column_name,
+ conflict_type, local_value, source_value, chosen_value,
+ policy_applied, manual_required, resolution_status, detected_at,
+ domain, ship_imo, environment, source_db, target_db, sync_direction)
+VALUES
+(@batch, @tbl, @pk, @col,
+ 'parallel_edit',
+ JSON_OBJECT('value', @tval),
+ JSON_OBJECT('value', @sval),
+ JSON_OBJECT('value', @chosen),
+ 'auto_online_wins',
+ 1, 'queued_manual', UTC_TIMESTAMP(),
+ @domain, @imo, @env, @src, @tgt, @dir);";
+
+            int successCount = 0;
+
+            foreach (var r in rows)
+            {
+                try
+                {
+                    var parameters = new
+                    {
+                        batch = batchId,
+                        tbl = table,
+                        pk = r.Pk,
+                        col = column,
+                        tval = ConvertToString(r.TargetValue),
+                        sval = ConvertToString(r.SourceValue),
+                        chosen = ConvertToString(r.ChosenValue),
+                        domain = _domain,
+                        imo = _shipImo,
+                        env = _env,
+                        src = SourceDb,
+                        tgt = TargetDb,
+                        dir = _direction
+                    };
+
+                    await _conn.ExecuteAsync(sql, parameters);
+                    successCount++;
+
+                    _log.LogDebug("Conflict logged: {Table}.{Col} pk={Pk} target={TVal} source={SVal} → chosen={Chosen}",
+                        table, column, r.Pk, r.TargetValue, r.SourceValue, r.ChosenValue);
+                }
+                catch (Exception ex)
+                {
+                    // Log error to console AND logger
+                    Console.WriteLine($"  ⚠️ Conflict log failed for {table}.{column} pk={r.Pk}: {ex.Message}");
+                    _log.LogError(ex, "Failed to log conflict for {Table}.{Col} pk={Pk}: {Msg}",
+                        table, column, r.Pk, ex.Message);
+                }
+            }
+
+            if (successCount > 0)
+            {
+                _log.LogInformation("Logged {Count} conflict(s) for {Table}.{Col} [batch={Batch}]",
+                    successCount, table, column, batchId);
+            }
+        }
+
+        /// <summary>
+        /// Convert value to string for JSON storage, handling all MySQL types
+        /// </summary>
+        private static string? ConvertToString(object? val)
+        {
+            return val switch
+            {
+                null or DBNull => null,
+                DateTime dt => dt.ToString("O"),
+                DateTimeOffset dto => dto.ToString("O"),
+                byte[] bytes => Convert.ToBase64String(bytes),
+                bool b => b ? "true" : "false",
+                _ => Convert.ToString(val, CultureInfo.InvariantCulture)
+            };
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PROGRESS DISPLAY
+        // ═══════════════════════════════════════════════════════════════════
+
+        private static void PrintProgress(int done, int total, string prefix)
+        {
+            total = Math.Max(total, 1);
+            int pct = (int)(done * 100.0 / total);
+            int bars = (int)(30.0 * done / total);
+
+            Console.Write($"\r{prefix} [{new string('#', bars)}{new string('.', 30 - bars)}] {pct,3}% ({done}/{total})   ");
+        }
+    }
+}
