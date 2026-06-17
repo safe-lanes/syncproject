@@ -1,0 +1,1 @@
+- [SyncConsole Replit setup](synccode-replit-setup.md) — .NET 8 console MySQL sync CLI; runs via local MariaDB; not a web app.
