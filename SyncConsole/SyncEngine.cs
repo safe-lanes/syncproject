@@ -196,8 +196,22 @@ namespace SyncConsole
 
             if (filteredColumns.Count == 0)
             {
-                _log.LogWarning("Skipping {Table}: no matching columns found in both databases.", table);
-                return new SyncResult(inserted, updated, deleted, conflicts);
+                // The soft-delete column is intentionally excluded from CompareColumns
+                // (it is handled only by the dedicated propagation step below). If it is
+                // the ONLY shared non-PK column, we must NOT skip the table — otherwise
+                // its deletes would never propagate. Proceed when a delete column exists
+                // in both DBs; the field-merge loop simply becomes a no-op for this table.
+                bool deleteColInBoth =
+                    shipDbColumns.Any(c => Db.DeleteColumnNames.Contains(c)) &&
+                    centralDbColumns.Any(c => Db.DeleteColumnNames.Contains(c));
+
+                if (!deleteColInBoth)
+                {
+                    _log.LogWarning("Skipping {Table}: no matching columns found in both databases.", table);
+                    return new SyncResult(inserted, updated, deleted, conflicts);
+                }
+
+                _log.LogDebug("Table {Table}: only soft-delete column shared; running insert + soft-delete propagation only.", table);
             }
 
             if (filteredColumns.Count < meta.CompareColumns.Count)
@@ -789,7 +803,7 @@ WHERE COALESCE(s.`{sourceDelCol}`, 0) = 1
             {
                 _log.LogWarning("🔄 {Table}: {Count} conflicts where target was updated to match online",
                     table, targetUpdated);
-            }L
+            }
 
             return new SyncResult(inserted, updated, deleted, conflicts);
         }

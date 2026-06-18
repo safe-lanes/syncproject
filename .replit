@@ -1,4 +1,4 @@
-modules = ["dotnet-7.0", "dotnet-8.0"]
+modules = ["dotnet-7.0", "dotnet-8.0", "python-3.11"]
 [agent]
 expertMode = true
 stack = "BEST_EFFORT_FALLBACK"

@@ -30,6 +30,17 @@ public static class Db
     };
 
     // ═══════════════════════════════════════════════════════════════════════
+    // SOFT-DELETE COLUMNS - Excluded from field-level comparison
+    // These are handled exclusively by the dedicated soft-delete propagation
+    // step (monotonic 0→1, direction- and timestamp-aware). Keeping the name
+    // set here as the single source of truth (also used by the sync engine).
+    // ═══════════════════════════════════════════════════════════════════════
+    public static readonly HashSet<string> DeleteColumnNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "is_deleted", "isdeleted", "deleted"
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════
     // HASH-ON-THE-FLY SYNC DESIGN
     // Single source of truth for hash computation
     // ═══════════════════════════════════════════════════════════════════════
@@ -609,16 +620,21 @@ public static class Db
         ).COLUMN_NAME;
 
         // Check for soft-delete column
-        var hasDeleted = colList.Any(c =>
-            new[] { "is_deleted", "isdeleted", "deleted" }
-                .Contains(c.COLUMN_NAME.ToLower()));
+        var hasDeleted = colList.Any(c => DeleteColumnNames.Contains(c.COLUMN_NAME));
 
         // ═══════════════════════════════════════════════════════════════════
         // CRITICAL FIX: Use SystemColumns HashSet to exclude ALL system columns
         // This prevents updatedAt/createdAt from causing false conflict detection
+        //
+        // Also exclude the soft-delete column: it is handled exclusively by the
+        // dedicated soft-delete propagation step (monotonic 0→1, direction- and
+        // timestamp-aware). Including it in the field-level merge would let the
+        // generic 3-way merge un-delete rows (1→0) and bypass that step's guard.
         // ═══════════════════════════════════════════════════════════════════
         var compareCols = colList
-            .Where(c => c.COLUMN_KEY != "PRI" && !SystemColumns.Contains(c.COLUMN_NAME.ToLower()))
+            .Where(c => c.COLUMN_KEY != "PRI"
+                && !SystemColumns.Contains(c.COLUMN_NAME.ToLower())
+                && !DeleteColumnNames.Contains(c.COLUMN_NAME))
             .Select(c => c.COLUMN_NAME)
             .ToList();
 
