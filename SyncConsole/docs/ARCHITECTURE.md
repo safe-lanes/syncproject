@@ -275,8 +275,9 @@ Case 5 is the only place a conflict log row is written.
 
 If both sides have an `is_deleted`-shaped column:
 
-- **`online_to_ship`**: any row where `source.deleted=1 AND target.deleted=0` is marked deleted unconditionally.
-- **`ship_to_online`**: same, **but only if** `target.updatedAt <= source.updatedAt`. This prevents propagating an old ship-side delete over a more recent online-side edit. (Bug 2 fix.)
+- **`online_to_ship`** (delete, `0→1`): any row where `source.deleted=1 AND target.deleted=0` is marked deleted unconditionally (online wins).
+- **`ship_to_online`** (delete, `0→1`): same, **but only if** `target.updatedAt <= source.updatedAt`. This prevents propagating an old ship-side delete over a more recent online-side edit. (Bug 2 fix.)
+- **`online_to_ship`** (un-delete / restore, `1→0`): a row that is active online (`source.deleted=0`) but soft-deleted on the ship (`target.deleted=1`) is **restored on the ship**, **but only if** the table has a timestamp column AND `target.updatedAt <= source.updatedAt`. The timestamp guard ensures a more recent ship-side delete is never resurrected by a stale online row; without a timestamp column no restore happens (the row stays deleted). This is the only place the engine flips a delete flag back to `0`. There is intentionally **no** un-delete in `ship_to_online` — the online side's deleted state is authoritative and the ship cannot restore it.
 
 ---
 
@@ -361,7 +362,7 @@ These statements should be true at all times. If any is violated, sync correctne
 | 5 | A row is inserted only if its PK is missing in target (and optionally a UNIQUE-key dedup passes) | `INSERT IGNORE … LEFT JOIN … WHERE t.pk IS NULL` |
 | 6 | FK constraints are off during sync, and re-enabled after | `Db.SetSessionAsync` + `Db.EnableForeignKeyChecksAsync` in `Program.RunAsync.finally` |
 | 7 | Online wins on Case 5 conflict (with `SHIP_FILLS_GAP` exception if source value is empty) | `SyncEngine.cs:593–633` |
-| 8 | Soft-delete only propagates respecting timestamp on ship→online | `SyncEngine.cs:739–760` |
+| 8 | Soft-delete delete (`0→1`) is timestamp-guarded on ship→online **when a timestamp column exists** (falls back to unconditional if none), and unconditional on online→ship; un-delete (`1→0`) happens only on online→ship and only when a timestamp column exists and `target.updatedAt <= source.updatedAt` | `SyncEngine.cs` §Step 6 soft-delete block |
 
 ---
 

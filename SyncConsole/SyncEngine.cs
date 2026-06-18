@@ -778,6 +778,29 @@ WHERE COALESCE(s.`{sourceDelCol}`, 0) = 1
 
                         if (delCount > 0)
                             _log.LogInformation("Propagated {Count} soft deletes for {Table}", delCount, table);
+
+                        // Online→Ship un-delete (restore): if online has the row active
+                        // (isDeleted=0) but ship has it soft-deleted (isDeleted=1), restore it
+                        // on the ship — but ONLY if online's row is newer (online wins on a fresh
+                        // edit), so a more recent ship-side delete is never resurrected. Requires a
+                        // timestamp column; without one we cannot compare, so we leave it deleted.
+                        if (_direction == "online_to_ship" && meta.UpdatedCol != null)
+                        {
+                            var sqlUndel = $@"
+UPDATE `{TargetDb}`.`{table}` t
+JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`
+SET t.`{localDelCol}` = 0
+WHERE COALESCE(s.`{sourceDelCol}`, 0) = 0
+  AND COALESCE(t.`{localDelCol}`, 0) = 1
+  AND t.`{meta.UpdatedCol}` IS NOT NULL
+  AND s.`{meta.UpdatedCol}` IS NOT NULL
+  AND t.`{meta.UpdatedCol}` <= s.`{meta.UpdatedCol}`;";
+
+                            var undelCount = await _conn.ExecuteAsync(sqlUndel);
+
+                            if (undelCount > 0)
+                                _log.LogInformation("Restored {Count} soft deletes for {Table} (online active, newer)", undelCount, table);
+                        }
                     }
                 }
                 catch (MySqlException ex)

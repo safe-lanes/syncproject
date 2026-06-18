@@ -1,1 +1,1 @@
-- [SyncConsole Replit setup](synccode-replit-setup.md) — .NET 8 console MySQL sync CLI; runs via local MariaDB; not a web app.
+- [Soft-delete semantics](soft-delete-semantics.md) — directional delete/un-delete rules in SyncEngine; delete flag handled only by the dedicated step, un-delete is online→ship + timestamp-guarded.
