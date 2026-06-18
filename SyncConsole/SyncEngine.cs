@@ -789,7 +789,7 @@ WHERE COALESCE(s.`{sourceDelCol}`, 0) = 1
             {
                 _log.LogWarning("🔄 {Table}: {Count} conflicts where target was updated to match online",
                     table, targetUpdated);
-            }
+            }L
 
             return new SyncResult(inserted, updated, deleted, conflicts);
         }
