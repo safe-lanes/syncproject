@@ -11,3 +11,6 @@ SyncConsole/.db/
 
 # Logs
 *.log
+
+[Oo]bj/
+[Bb]in/
