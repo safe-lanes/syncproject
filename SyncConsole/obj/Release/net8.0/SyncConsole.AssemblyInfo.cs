@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("SyncConsole")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d5ebe80959c05348511cbb5a9f05148897752a82")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4a8425f71f52c818647c72e7f90287fa8351b5bb")]
 [assembly: System.Reflection.AssemblyProductAttribute("SyncConsole")]
 [assembly: System.Reflection.AssemblyTitleAttribute("SyncConsole")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
