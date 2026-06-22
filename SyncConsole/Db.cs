@@ -217,8 +217,13 @@ public static class Db
            
             // FIX: Handle MySQL zero datetime values  
             AllowZeroDateTime = true,
-            ConvertZeroDateTime = false  // Don't convert - Dapper handles nulls better this way
+            ConvertZeroDateTime = false,  // Don't convert - Dapper handles nulls better this way
 
+            // FIX: Do NOT auto-map CHAR(36) columns to System.Guid. These columns may
+            // legitimately hold non-UUID strings (e.g. "3400037"), which makes the
+            // default Guid parsing throw FormatException. Reading them as plain strings
+            // is correct for a generic, table-agnostic sync.
+            GuidFormat = MySqlGuidFormat.None
         };
 
         return builder.ConnectionString;
