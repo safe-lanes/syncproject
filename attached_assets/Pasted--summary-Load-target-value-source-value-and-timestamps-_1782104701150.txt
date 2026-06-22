@@ -1,0 +1,50 @@
+/// <summary>
+    /// Load target value, source value, and timestamps for a batch of PKs and single column
+    /// </summary>
+    public static async Task<Dictionary<string, (object? tval, object? sval, DateTime? tt, DateTime? ts)>> LoadValueTriplesAsync(
+        MySqlConnection cnn, string targetDb, string sourceDb, string table, string pkCol,
+        IEnumerable<string> pks, string column, string? updatedCol)
+    {
+        var pkList = pks.ToList();
+        if (pkList.Count == 0) return new();
+
+        var inList = string.Join(",", pkList.Select(p => $"'{MySqlHelper.EscapeString(p)}'"));
+        string selectTs = string.IsNullOrEmpty(updatedCol)
+            ? "NULL AS tt, NULL AS ts"
+            : $"t.`{updatedCol}` AS tt, s.`{updatedCol}` AS ts";
+
+        //        var sql = $@"
+        //SELECT CAST(t.`{pkCol}` AS CHAR) AS pk, t.`{column}` AS tval, s.`{column}` AS sval, {selectTs}
+        //FROM `{targetDb}`.`{table}` t
+        //JOIN `{sourceDb}`.`{table}` s ON s.`{pkCol}`=t.`{pkCol}`
+        //WHERE t.`{pkCol}` IN ({inList});";
+
+        var sql = $@"
+SELECT
+    CAST(t.`{pkCol}` AS CHAR) AS pk,
+    CAST(t.`{column}` AS CHAR) AS tval,
+    CAST(s.`{column}` AS CHAR) AS sval,
+    {selectTs}
+FROM `{targetDb}`.`{table}` t
+JOIN `{sourceDb}`.`{table}` s
+    ON s.`{pkCol}` = t.`{pkCol}`
+WHERE t.`{pkCol}` IN ({inList});";
+
+        // Use dynamic to handle MySqlDateTime conversion issues with zero dates
+        var rows = await cnn.QueryAsync<dynamic>(sql);
+        var result = new Dictionary<string, (object? tval, object? sval, DateTime? tt, DateTime? ts)>();
+
+        foreach (var row in rows)
+        {
+            var rowDict = (IDictionary<string, object?>)row;
+            string pk = rowDict["pk"]?.ToString() ?? "";
+            object? tval = rowDict["tval"];
+            object? sval = rowDict["sval"];
+            DateTime? tt = SafeConvertToDateTime(rowDict["tt"]);
+            DateTime? ts = SafeConvertToDateTime(rowDict["ts"]);
+
+            result[pk] = (tval, sval, tt, ts);
+        }
+
+        return result;
+    }
