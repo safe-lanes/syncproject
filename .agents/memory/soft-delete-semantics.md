@@ -19,17 +19,18 @@ Current rules:
   `target(online).updatedAt <= source(ship).updatedAt`; falls back to
   unconditional if there is no timestamp column.
 - Delete `0→1`, `online_to_ship`: unconditional (online wins).
-- Un-delete `1→0`: ONLY in `online_to_ship`, and ONLY when a timestamp column
-  exists AND `target(ship).updatedAt <= source(online).updatedAt`. No un-delete
-  in `ship_to_online`.
+- Un-delete `1→0`: ONLY in `online_to_ship`, UNCONDITIONAL (online wins) — an
+  active online row always restores the ship's soft-deleted copy, with NO
+  timestamp comparison. Currently still gated on the table HAVING a timestamp
+  column (existence only; value not compared), so timestamp-less tables get no
+  restore today. No un-delete in `ship_to_online`.
 
-**Why:** Deletes from the authoritative cloud are treated as safe; restores
-(resurrecting a soft-deleted row) are dangerous, so un-delete is gated behind a
-strict timestamp guard to ensure a more recent ship-side delete is never
-resurrected by a stale online row. NULL/missing timestamps mean "don't restore"
-(conservative) for un-delete, unlike the delete guard which treats NULL as
-"go ahead". `ship_to_online` has no un-delete because the online side's deleted
-state is authoritative and the ship must not override it.
+**Why:** "Online wins" — the authoritative cloud's active state always wins,
+including restores; the product owner intentionally dropped the older
+newer-timestamp guard so un-delete mirrors the delete rule rather than being
+gated behind a strict timestamp comparison. `ship_to_online` has no un-delete
+because the online side's deleted state is authoritative and the ship must not
+override it.
 
 ## Business-key duplicate resolution (online wins)
 
@@ -65,7 +66,8 @@ copy must stop showing; deleted rows never render, so syncing the deletion to
 online is harmless and keeps both sides consistent.
 
 **How to apply:** Any future change to delete-flag handling must stay inside the
-dedicated soft-delete step (do not re-add the flag to the field merge), and must
-keep the asymmetry above unless the product owner explicitly changes the
-"online wins" / "deletes are safe, restores are guarded" contract. Keep
+dedicated soft-delete step (do not re-add the flag to the field merge). The
+current contract is "online wins" for BOTH deletes and restores — un-delete is
+unconditional (no timestamp guard), changed deliberately by the product owner; do
+not re-add a restore-side timestamp guard without their explicit say-so. Keep
 `docs/ARCHITECTURE.md` §7 (Step 6) and invariant #8 in sync with any change.

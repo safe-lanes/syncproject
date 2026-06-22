@@ -933,9 +933,12 @@ WHERE COALESCE(s.`{sourceDelCol}`, 0) = 1
 
                         // Online→Ship un-delete (restore): if online has the row active
                         // (isDeleted=0) but ship has it soft-deleted (isDeleted=1), restore it
-                        // on the ship — but ONLY if online's row is newer (online wins on a fresh
-                        // edit), so a more recent ship-side delete is never resurrected. Requires a
-                        // timestamp column; without one we cannot compare, so we leave it deleted.
+                        // on the ship. This is UNCONDITIONAL — online always wins, with NO
+                        // timestamp comparison: an active online row always resurrects the ship's
+                        // soft-deleted copy. (Intentional product-owner decision: restores follow
+                        // the same "online wins" rule as deletes, not a newer-timestamp guard.)
+                        // NOTE: still gated on a timestamp column EXISTING (its value is no longer
+                        // compared); tables without one currently get no restore.
                         if (_direction == "online_to_ship" && meta.UpdatedCol != null)
                         {
                             var sqlUndel = $@"
