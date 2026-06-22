@@ -214,7 +214,7 @@ public static class Db
 
             // SSL settings (adjust based on your environment)
             SslMode = MySqlSslMode.Preferred,
-           
+
             // FIX: Handle MySQL zero datetime values  
             AllowZeroDateTime = true,
             ConvertZeroDateTime = false,  // Don't convert - Dapper handles nulls better this way
@@ -815,6 +815,9 @@ LIMIT {batch} OFFSET {offset};";
     /// <summary>
     /// Load target value, source value, and timestamps for a batch of PKs and single column
     /// </summary>
+    /// <summary>
+    /// Load target value, source value, and timestamps for a batch of PKs and single column
+    /// </summary>
     public static async Task<Dictionary<string, (object? tval, object? sval, DateTime? tt, DateTime? ts)>> LoadValueTriplesAsync(
         MySqlConnection cnn, string targetDb, string sourceDb, string table, string pkCol,
         IEnumerable<string> pks, string column, string? updatedCol)
@@ -827,10 +830,21 @@ LIMIT {batch} OFFSET {offset};";
             ? "NULL AS tt, NULL AS ts"
             : $"t.`{updatedCol}` AS tt, s.`{updatedCol}` AS ts";
 
+        //        var sql = $@"
+        //SELECT CAST(t.`{pkCol}` AS CHAR) AS pk, t.`{column}` AS tval, s.`{column}` AS sval, {selectTs}
+        //FROM `{targetDb}`.`{table}` t
+        //JOIN `{sourceDb}`.`{table}` s ON s.`{pkCol}`=t.`{pkCol}`
+        //WHERE t.`{pkCol}` IN ({inList});";
+
         var sql = $@"
-SELECT CAST(t.`{pkCol}` AS CHAR) AS pk, t.`{column}` AS tval, s.`{column}` AS sval, {selectTs}
+SELECT
+    CAST(t.`{pkCol}` AS CHAR) AS pk,
+    CAST(t.`{column}` AS CHAR) AS tval,
+    CAST(s.`{column}` AS CHAR) AS sval,
+    {selectTs}
 FROM `{targetDb}`.`{table}` t
-JOIN `{sourceDb}`.`{table}` s ON s.`{pkCol}`=t.`{pkCol}`
+JOIN `{sourceDb}`.`{table}` s
+    ON s.`{pkCol}` = t.`{pkCol}`
 WHERE t.`{pkCol}` IN ({inList});";
 
         // Use dynamic to handle MySqlDateTime conversion issues with zero dates
@@ -1003,7 +1017,7 @@ ON DUPLICATE KEY UPDATE
     last_synced_at=VALUES(last_synced_at);";
 
             // ADDED: Detect and warn about NULL values in shadow
-            
+
             // Retry logic for transient failures
             for (int retry = 0; retry < maxRetries; retry++)
             {
@@ -1078,6 +1092,7 @@ ON DUPLICATE KEY UPDATE
 
         try
         {
+            await conn.ExecuteAsync($"USE `{targetDb}`");
             // Create temporary table (MEMORY engine for speed)
             await conn.ExecuteAsync($@"
             CREATE TEMPORARY TABLE `{tempTable}` (
