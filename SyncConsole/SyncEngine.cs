@@ -247,6 +247,90 @@ namespace SyncConsole
                 SourceDb, TargetDb, _direction);
 
             // ──────────────────────────────────────────────────────────────
+            // 1.5) Business-key duplicate resolution (online wins)
+            //
+            // When the same logical record was independently created on BOTH sides
+            // (same configured business key, different auto-increment PKs), the
+            // ONLINE row is authoritative. Every SHIP row that shares the business
+            // key with an ACTIVE online row is soft-deleted so it stops showing on
+            // the ship — EXCEPT the genuinely-synced canonical row (same PK AND same
+            // business key as an online row), which is preserved. Guarding the
+            // "keep" on PK *and* business key (not PK alone) makes it robust to
+            // PK-number collisions across the two independent auto-increment
+            // sequences, and guarantees the by-PK delete propagation can never
+            // delete online's own record.
+            //
+            // This runs BEFORE the insert step below so a retired (soft-deleted)
+            // ship row is propagated to online in the SAME run: soft-deleted source
+            // rows bypass the business-key dedup, so the insert step copies the
+            // now-deleted row to online where it stays invisible (marked deleted).
+            // ──────────────────────────────────────────────────────────────
+            if (meta.HasDeleted && meta.BusinessKey is { Count: > 0 })
+            {
+                try
+                {
+                    var shipDelCol = await Db.GetDeletedFlagColumnAsync(_conn, _shipDb, table);
+                    var onlineDelCol = await Db.GetDeletedFlagColumnAsync(_conn, _centralDb, table);
+
+                    var bkInBoth = meta.BusinessKey.All(k =>
+                        shipDbColumns.Contains(k, StringComparer.OrdinalIgnoreCase) &&
+                        centralDbColumns.Contains(k, StringComparer.OrdinalIgnoreCase));
+
+                    if (string.IsNullOrEmpty(shipDelCol) || string.IsNullOrEmpty(onlineDelCol))
+                    {
+                        _log.LogDebug("Skipping business-key duplicate resolution for {Table}: no soft-delete column in both databases.", table);
+                    }
+                    else if (!bkInBoth)
+                    {
+                        _log.LogDebug("Skipping business-key duplicate resolution for {Table}: key columns not present in both databases.", table);
+                    }
+                    else
+                    {
+                        var bkMatch = string.Join(" AND ",
+                            meta.BusinessKey.Select(k => $"o.`{k}` <=> sh.`{k}`"));
+
+                        // Keep-guard matches the canonical online row on PK *and* key.
+                        var bkSelfMatch = string.Join(" AND ",
+                            meta.BusinessKey.Select(k => $"o2.`{k}` <=> sh.`{k}`"));
+
+                        // A row whose business key is (all) NULL is not a meaningful
+                        // logical identity, and `<=>` treats NULL=NULL as equal — which
+                        // would over-retire unrelated empty-key rows. Only retire ship
+                        // rows whose configured key columns are fully populated.
+                        var bkNotNull = string.Join(" AND ",
+                            meta.BusinessKey.Select(k => $"sh.`{k}` IS NOT NULL"));
+
+                        var sqlDupDel = $@"
+UPDATE `{_shipDb}`.`{table}` sh
+SET sh.`{shipDelCol}` = 1
+WHERE COALESCE(sh.`{shipDelCol}`, 0) = 0
+  AND {bkNotNull}
+  AND EXISTS (
+    SELECT 1 FROM `{_centralDb}`.`{table}` o
+    WHERE COALESCE(o.`{onlineDelCol}`, 0) = 0
+      AND {bkMatch})
+  AND NOT EXISTS (
+    SELECT 1 FROM `{_centralDb}`.`{table}` o2
+    WHERE o2.`{meta.Pk}` = sh.`{meta.Pk}`
+      AND {bkSelfMatch});";
+
+                        var dupDelCount = await _conn.ExecuteAsync(sqlDupDel);
+                        if (dupDelCount > 0)
+                        {
+                            deleted += dupDelCount;
+                            _log.LogInformation(
+                                "Retired {Count} ship-side business-key duplicate(s) for {Table} (online wins)",
+                                dupDelCount, table);
+                        }
+                    }
+                }
+                catch (MySqlException ex)
+                {
+                    _log.LogWarning("Business-key duplicate resolution failed for {Table}: {Error}", table, ex.Message);
+                }
+            }
+
+            // ──────────────────────────────────────────────────────────────
             // 2) Insert rows that exist only on source
             // FIX: Only use columns that exist in BOTH databases to avoid schema mismatch
             // FIX: Use INSERT IGNORE to prevent duplicate key errors on re-runs
@@ -853,67 +937,6 @@ WHERE COALESCE(s.`{sourceDelCol}`, 0) = 0
                                 _log.LogInformation("Restored {Count} soft deletes for {Table} (online active, newer)", undelCount, table);
                         }
 
-                        // ── Business-key duplicate resolution: online wins ──
-                        // When the same logical record was independently created on BOTH
-                        // sides (same configured business key, different auto-increment
-                        // PKs), the ONLINE row is authoritative. Soft-delete the
-                        // ship-originated duplicate so it stops showing on the ship. The
-                        // hidden row then propagates online via the normal insert path
-                        // (soft-deleted source rows are never suppressed by the dedup),
-                        // where it stays invisible because it is marked deleted.
-                        if (meta.BusinessKey is { Count: > 0 })
-                        {
-                            var bkInBoth = meta.BusinessKey.All(k =>
-                                shipDbColumns.Contains(k, StringComparer.OrdinalIgnoreCase) &&
-                                centralDbColumns.Contains(k, StringComparer.OrdinalIgnoreCase));
-
-                            if (!bkInBoth)
-                            {
-                                _log.LogDebug("Skipping business-key duplicate resolution for {Table}: key columns not present in both databases.", table);
-                            }
-                            else
-                            {
-                                var shipDelCol = _direction == "ship_to_online" ? sourceDelCol : localDelCol;
-                                var onlineDelCol = _direction == "ship_to_online" ? localDelCol : sourceDelCol;
-
-                                var bkMatch = string.Join(" AND ",
-                                    meta.BusinessKey.Select(k => $"o.`{k}` <=> sh.`{k}`"));
-
-                                // A row whose business key is (all) NULL is not a meaningful
-                                // logical identity, and `<=>` treats NULL=NULL as equal — which
-                                // would over-retire unrelated empty-key rows. Only retire ship
-                                // rows whose configured key columns are fully populated.
-                                var bkNotNull = string.Join(" AND ",
-                                    meta.BusinessKey.Select(k => $"sh.`{k}` IS NOT NULL"));
-
-                                // Soft-delete a SHIP row when an ACTIVE online row shares its
-                                // business key AND this ship row is ship-originated (its PK does
-                                // not exist on online). The PK-absence guard guarantees we never
-                                // retire the genuinely-synced canonical row, and we stay
-                                // conservative if a PK happens to collide across the two sides.
-                                var sqlDupDel = $@"
-UPDATE `{_shipDb}`.`{table}` sh
-SET sh.`{shipDelCol}` = 1
-WHERE COALESCE(sh.`{shipDelCol}`, 0) = 0
-  AND {bkNotNull}
-  AND EXISTS (
-    SELECT 1 FROM `{_centralDb}`.`{table}` o
-    WHERE COALESCE(o.`{onlineDelCol}`, 0) = 0
-      AND {bkMatch})
-  AND NOT EXISTS (
-    SELECT 1 FROM `{_centralDb}`.`{table}` o2
-    WHERE o2.`{meta.Pk}` = sh.`{meta.Pk}`);";
-
-                                var dupDelCount = await _conn.ExecuteAsync(sqlDupDel);
-                                if (dupDelCount > 0)
-                                {
-                                    deleted += dupDelCount;
-                                    _log.LogInformation(
-                                        "Retired {Count} ship-side business-key duplicate(s) for {Table} (online wins)",
-                                        dupDelCount, table);
-                                }
-                            }
-                        }
                     }
                 }
                 catch (MySqlException ex)

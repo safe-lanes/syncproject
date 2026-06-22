@@ -29,14 +29,13 @@ auto-increment id can map to different logical rows across sides — that requir
 matching the merge step by business key too (still deferred).
 
 **Duplicate resolution when both sides already created the row** (online wins):
-for business-key tables that also have a soft-delete column, the soft-delete step
-retires the ship-originated duplicate (sets `is_deleted=1` on the ship) when an
-*active* online row shares the business key AND no online row has the ship row's
-PK (PK-absence = ship-originated; never retires the synced canonical row). The
-retired row then flows to online normally because a soft-deleted *source* row is
-intentionally exempted from the insert dedup — it lands on online as a deleted
-row (invisible) and the two DBs converge, usually over two runs. See
-soft-delete-semantics.md for the full contract.
+for business-key tables that also have a soft-delete column, a pre-insert step
+retires EVERY ship row whose business key matches an *active* online row, except
+the true synced canonical (matched on PK **and** business key — never PK alone,
+which breaks on cross-side auto-increment collisions). It runs BEFORE
+insert-missing, so the retired (deleted) row propagates to online in the SAME
+run via the dedup's soft-deleted-source exemption. See soft-delete-semantics.md
+for the full contract and the bidirectional nuance.
 
 **Gotchas / rules:**
 - The column must exist in **both** config tables (`offline_sync_tables` AND

@@ -286,18 +286,32 @@ soft-delete column on both sides, the engine resolves the case where the *same
 logical record* was independently created on both sides — same business key, but
 different auto-increment PKs. The online row is authoritative:
 
-- The **ship-originated duplicate is soft-deleted** (`0→1`) so it stops showing on
-  the ship. A ship row is retired only when an **active** online row shares its
-  business key **and** the ship row's PK does **not** exist on online (the
-  PK-absence guard guarantees the genuinely-synced canonical row is never retired,
-  and the engine stays conservative on any cross-side PK collision).
-- The hidden ship row then **propagates to online via the normal insert path**: a
-  soft-deleted source row is intentionally **not** suppressed by the business-key
-  dedup, so it inserts on the target as a deleted row. It never renders anywhere
-  (deleted), and both databases converge to the same set of rows (typically over
-  two runs: retire on run *n*, propagate on run *n+1*).
+- **Every** ship row that shares its business key with an **active** online row is
+  soft-deleted (`0→1`) so it stops showing on the ship — **except** the genuinely-
+  synced canonical row, identified as a ship row whose **PK *and* business key**
+  both match an online row. The keep-guard is matched on PK **and** business key
+  (not PK alone) so it is robust to PK-number collisions across the two independent
+  auto-increment sequences, and it guarantees the by-PK delete propagation can
+  never delete online's own record. In the common case where online's record was
+  never synced down to the ship, **all** ship duplicates for that key are retired.
+- This resolution runs **before** the insert-missing step, so the retired ship row
+  **propagates to online in the same run**: a soft-deleted source row is
+  intentionally **not** suppressed by the business-key dedup, so the insert step
+  copies the now-deleted row to online as a deleted row. It never renders anywhere
+  (deleted), and both databases converge to the same set of rows in a single run.
 - Tables **without** a configured business key are unaffected; active-row dedup
   behavior is unchanged.
+
+> **Bidirectional note:** the keep-guard preserves online's canonical record
+> (retiring it would delete online's own row via the by-PK delete propagation, so
+> it is deliberately not done). When `online_to_ship` later runs it tries to
+> insert that canonical onto the ship, but the retired ship row — though
+> soft-deleted — still carries the business key, and the insert-missing dedup's
+> `NOT EXISTS` predicate matches **any** target row with that key (deleted or
+> not). So the canonical is suppressed and the ship continues to show **nothing**
+> for that key, which matches the intended "online wins, ship hides its copy"
+> outcome. (If a future change should instead surface online's copy on the ship,
+> the dedup predicate would need to ignore soft-deleted target rows.)
 
 > **NULL-key contract:** a row is only retired when **all** configured key columns
 > are non-NULL. An all-NULL business key is not a meaningful logical identity, and
