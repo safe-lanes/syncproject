@@ -337,8 +337,8 @@ Example:
             foreach (var t in tables)
             {
                 tableIndex++;
-                log.LogDebug("Processing table {Index}/{Total}: {Table}", tableIndex, tables.Count, t);
-                var result = await engine.SyncTableAsync(t);
+                log.LogDebug("Processing table {Index}/{Total}: {Table}", tableIndex, tables.Count, t.Table);
+                var result = await engine.SyncTableAsync(t.Table, t.BusinessKey);
                 totalInserts += result.Inserts;
                 totalUpdates += result.Updates;
                 totalDeletes += result.Deletes;

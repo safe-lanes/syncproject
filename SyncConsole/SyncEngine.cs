@@ -119,7 +119,7 @@ namespace SyncConsole
         /// <summary>
         /// Main sync method for a single table
         /// </summary>
-        public async Task<SyncResult> SyncTableAsync(string table)
+        public async Task<SyncResult> SyncTableAsync(string table, List<string>? businessKey = null)
         {
             int inserted = 0, updated = 0, deleted = 0, conflicts = 0;
 
@@ -234,6 +234,11 @@ namespace SyncConsole
             // Replace meta columns with filtered columns
             meta = meta with { CompareColumns = filteredColumns };
 
+            // Attach the per-table business key from sync config (businessKeyColumn).
+            // Empty for tables where the config column is NULL — those keep the
+            // existing auto-increment/unique-index dedup behavior unchanged.
+            meta = meta with { BusinessKey = businessKey ?? new List<string>() };
+
             _log.LogDebug("Table {Table}: PK={Pk}, comparing {Count} columns (filtered to both DBs)",
                 table, meta.Pk, meta.CompareColumns.Count);
 
@@ -286,7 +291,42 @@ namespace SyncConsole
                 // so inserts can happen in any table order safely.
                 // ═══════════════════════════════════════════════════════════════
                 string bizKeyFilter = "";
-                if (await IsAutoIncrementPkAsync(meta.Pk, TargetDb, table))
+
+                // ─── Precedence 1: explicit per-table business key from sync config ───
+                // (businessKeyColumn JSON, e.g. ["nearmissId","nearmissImpactId"]).
+                // When set, it is the authority: it overrides the auto-increment/
+                // unique-index heuristic and applies regardless of PK type. This is
+                // what dedups junction/selection rows that share the same business
+                // key but were assigned different auto-increment PKs on each side.
+                var configKey = meta.BusinessKey ?? new List<string>();
+                if (configKey.Count > 0)
+                {
+                    var missing = configKey
+                        .Where(k => !insertColumns.Contains(k, StringComparer.OrdinalIgnoreCase))
+                        .ToList();
+
+                    if (missing.Count == 0)
+                    {
+                        var conditions = string.Join(" AND ",
+                            configKey.Select(k => $"ex.`{k}` <=> s.`{k}`"));
+                        bizKeyFilter = $@"
+  AND NOT EXISTS (SELECT 1 FROM `{TargetDb}`.`{table}` ex WHERE {conditions})";
+                        _log.LogDebug("Business-key dedup (config) {Table}: [{Keys}]",
+                            table, string.Join(",", configKey));
+                    }
+                    else
+                    {
+                        // Don't build a partial-key filter — that could over-dedup.
+                        // Warn and fall through to the unique-index heuristic below.
+                        _log.LogWarning(
+                            "Business key for {Table} references columns not in the insert set: [{Missing}]. Falling back to unique-index dedup.",
+                            table, string.Join(",", missing));
+                    }
+                }
+
+                // ─── Precedence 2 (fallback): auto-increment PK + DB UNIQUE index ───
+                // Unchanged behavior for every table WITHOUT a configured business key.
+                if (bizKeyFilter.Length == 0 && await IsAutoIncrementPkAsync(meta.Pk, TargetDb, table))
                 {
                     var uniqueKeyCols = await GetUniqueKeyColumnsAsync(TargetDb, table);
                     if (uniqueKeyCols.Count > 0)

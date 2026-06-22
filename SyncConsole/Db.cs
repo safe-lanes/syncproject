@@ -575,17 +575,40 @@ public static class Db
     /// ship_to_online: Use offline_sync_tables (ship's table list)
     /// online_to_ship: Use online_sync_tables (online's table list)
     /// </summary>
-    public static async Task<List<string>> GetActiveTablesAsync(MySqlConnection central, string direction, ILogger log)
+    public static async Task<List<SyncTableConfig>> GetActiveTablesAsync(MySqlConnection central, string direction, ILogger log)
     {
-        var sql = direction?.ToLower() switch
+        var configTable = direction?.ToLower() switch
         {
-            "ship_to_online" => "SELECT tablename FROM sails_master.offline_sync_tables WHERE isActive=1 AND COALESCE(isMasterTable,0)=0 ORDER BY tablename",
-            "online_to_ship" => "SELECT tablename FROM sails_master.online_sync_tables WHERE isActive=1 AND COALESCE(isMasterTable,0)=0 ORDER BY tablename",
-            _ => "SELECT tablename FROM sails_master.online_sync_tables WHERE isActive=1 AND COALESCE(isMasterTable,0)=0 ORDER BY tablename"
+            "ship_to_online" => "offline_sync_tables",
+            "online_to_ship" => "online_sync_tables",
+            _ => "online_sync_tables"
         };
 
+        // businessKeyColumn is an OPTIONAL config column. Only select it if the
+        // config table actually has it, so a config table without the column
+        // (e.g. only one direction has been migrated) does not break the sync —
+        // business-key dedup simply stays disabled for that direction.
+        bool hasBizKeyCol = await central.ExecuteScalarAsync<int>(
+            @"SELECT COUNT(*) FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA='sails_master' AND TABLE_NAME=@tbl
+                 AND COLUMN_NAME='businessKeyColumn'",
+            new { tbl = configTable }) > 0;
+
+        var bizKeySelect = hasBizKeyCol ? "businessKeyColumn" : "NULL AS businessKeyColumn";
+        var sql = $"SELECT tablename, {bizKeySelect} FROM sails_master.{configTable} " +
+                  "WHERE isActive=1 AND COALESCE(isMasterTable,0)=0 ORDER BY tablename";
+
         log.LogInformation("📋 Loading table list for direction={Direction}", direction);
-        var list = (await central.QueryAsync<string>(sql)).ToList();
+        if (!hasBizKeyCol)
+        {
+            log.LogWarning(
+                "Config table sails_master.{Table} has no businessKeyColumn; business-key dedup is disabled for direction={Direction}.",
+                configTable, direction);
+        }
+        var rows = await central.QueryAsync<(string Tablename, string? BusinessKeyColumn)>(sql);
+        var list = rows
+            .Select(r => new SyncTableConfig(r.Tablename, ParseBusinessKey(r.BusinessKeyColumn, r.Tablename, log)))
+            .ToList();
         log.LogInformation("✓ Found {Count} active tables for direction={Direction}", list.Count, direction);
 
         if (list.Count == 0)
@@ -594,6 +617,50 @@ public static class Db
         }
 
         return list;
+    }
+
+    /// <summary>
+    /// Parse the optional businessKeyColumn config (a JSON array of column names,
+    /// e.g. ["nearmissId","nearmissImpactId"]). NULL/blank/invalid JSON yields an
+    /// empty list, which means "no business-key override" for that table.
+    /// </summary>
+    private static List<string> ParseBusinessKey(string? json, string table, ILogger log)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return new List<string>();
+
+        try
+        {
+            var cols = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json);
+            if (cols is null) return new List<string>();
+
+            var result = new List<string>();
+            foreach (var raw in cols)
+            {
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                var c = raw.Trim();
+
+                // These names are interpolated into SQL as identifiers, so accept
+                // only safe identifier characters. Anything else is dropped (and
+                // would also be rejected later by the allowlist against the table's
+                // real columns) — this closes the SQL-injection surface at the source.
+                if (!System.Text.RegularExpressions.Regex.IsMatch(c, "^[A-Za-z0-9_]+$"))
+                {
+                    log.LogWarning("Ignoring invalid business-key column name '{Col}' for {Table} (allowed: letters, digits, underscore).",
+                        c, table);
+                    continue;
+                }
+
+                if (!result.Contains(c, StringComparer.OrdinalIgnoreCase))
+                    result.Add(c);
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("Invalid businessKeyColumn JSON for {Table}: {Json} ({Error}); ignoring.",
+                table, json, ex.Message);
+            return new List<string>();
+        }
     }
 
     /// <summary>
