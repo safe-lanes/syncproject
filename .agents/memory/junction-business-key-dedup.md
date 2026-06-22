@@ -17,9 +17,12 @@ override" and the table keeps the legacy behavior.
 
 **Dedup precedence in the INSERT step:**
 1. Configured business key (when present) — authoritative; used for the
-   `NOT EXISTS` anti-join regardless of PK type. If ANY configured column is not
-   in the insert set, it warns and falls back rather than building a partial-key
-   predicate (a partial key would over-dedup and silently drop good rows).
+   `NOT EXISTS` anti-join regardless of PK type. The anti-join matches only
+   **active** target rows (`COALESCE(targetDelCol,0)=0`); a soft-deleted target
+   row does NOT block the insert — see "Union convergence" below. If ANY
+   configured column is not in the insert set, it warns and falls back rather than
+   building a partial-key predicate (a partial key would over-dedup and silently
+   drop good rows).
 2. Fallback (no configured key): the original auto-increment-PK + DB `UNIQUE`
    index heuristic. Tables without a business key behave exactly as before.
 
@@ -36,6 +39,15 @@ which breaks on cross-side auto-increment collisions). It runs BEFORE
 insert-missing, so the retired (deleted) row propagates to online in the SAME
 run via the dedup's soft-deleted-source exemption. See soft-delete-semantics.md
 for the full contract and the bidirectional nuance.
+
+**Union convergence (both sides contribute):** because the Precedence-1 anti-join
+ignores soft-deleted target rows, online's canonical of a shared row resurfaces on
+the ship after the ship's duplicate is retired. Net effect: both sides converge on
+the UNION of the two selections (online {1,2,3,4} + ship {3,4,5} → both {1,2,3,4,5}),
+the ship's own copies of the shared 3,4 left soft-deleted underneath. The converged
+state is stable (no further inserts/retires on later runs). The exemption is scoped
+to Precedence 1 only; the unique-index fallback (Precedence 2) is unchanged, and
+active-vs-active dedup still prevents the original duplicate-insert bug.
 
 **Gotchas / rules:**
 - The column must exist in **both** config tables (`offline_sync_tables` AND

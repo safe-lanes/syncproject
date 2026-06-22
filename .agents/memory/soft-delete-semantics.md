@@ -52,13 +52,14 @@ duplicates when the same logical record was independently created on both sides
 - **NULL-key contract:** only retire when ALL configured key columns are non-NULL.
   `<=>` treats NULL=NULL as equal, so an all-NULL key would over-retire unrelated
   empty-key rows.
-- **Bidirectional note:** the keep-guard preserves online's canonical. A later
-  `online_to_ship` run does NOT resurface it on the ship: the retired ship row,
-  though soft-deleted, still carries the business key, and the insert-missing
-  dedup's `NOT EXISTS` matches ANY target row with that key (deleted or not), so
-  the canonical stays suppressed and the ship shows nothing for that key. To
-  surface online's copy instead, the dedup predicate would need to ignore
-  soft-deleted target rows.
+- **Union convergence (both sides contribute):** the insert-missing business-key
+  dedup blocks an insert ONLY when an *active* target row already has the key — a
+  soft-deleted target row does NOT block (see junction-business-key-dedup.md).
+  This is what lets online's canonical of a shared row resurface on the ship after
+  the ship's duplicate is retired, so both sides converge on the UNION of the two
+  selections (e.g. online {1,2,3,4} + ship {3,4,5} → both end at {1,2,3,4,5}, with
+  the ship's own 3,4 left soft-deleted underneath). Active-vs-active dedup is
+  unchanged, so the original duplicate-insert prevention still holds.
 **Why:** the user's stated policy — if online has the record, the ship's separate
 copy must stop showing; deleted rows never render, so syncing the deletion to
 online is harmless and keeps both sides consistent.

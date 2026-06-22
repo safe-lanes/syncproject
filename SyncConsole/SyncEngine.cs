@@ -400,6 +400,20 @@ WHERE COALESCE(sh.`{shipDelCol}`, 0) = 0
                         var conditions = string.Join(" AND ",
                             configKey.Select(k => $"ex.`{k}` <=> s.`{k}`"));
 
+                        // Only ACTIVE target rows block an insert. A soft-deleted
+                        // target row (e.g. a ship duplicate retired by Step 1.5) must
+                        // NOT suppress the insert: otherwise the other side's canonical
+                        // selection could never sync across to replace the retired copy
+                        // and BOTH sides would permanently lose the common selection.
+                        // Ignoring deleted target rows lets the union of selections
+                        // converge while the retired duplicate stays invisible. Active
+                        // target rows still block, so the original active-vs-active
+                        // duplicate prevention is unchanged.
+                        var tgtDelCol = await Db.GetDeletedFlagColumnAsync(_conn, TargetDb, table);
+                        var tgtActiveFilter = string.IsNullOrEmpty(tgtDelCol)
+                            ? ""
+                            : $" AND COALESCE(ex.`{tgtDelCol}`, 0) = 0";
+
                         // Only ACTIVE source rows are deduped. A soft-deleted source
                         // row is allowed through even when its business key already
                         // exists on the target (it stays invisible because deleted).
@@ -408,7 +422,7 @@ WHERE COALESCE(sh.`{shipDelCol}`, 0) = 0
                             : $"COALESCE(s.`{srcDelCol}`, 0) = 1 OR ";
 
                         bizKeyFilter = $@"
-  AND ({srcActiveGuard}NOT EXISTS (SELECT 1 FROM `{TargetDb}`.`{table}` ex WHERE {conditions}))";
+  AND ({srcActiveGuard}NOT EXISTS (SELECT 1 FROM `{TargetDb}`.`{table}` ex WHERE {conditions}{tgtActiveFilter}))";
                         _log.LogDebug("Business-key dedup (config) {Table}: [{Keys}]",
                             table, string.Join(",", configKey));
                     }
