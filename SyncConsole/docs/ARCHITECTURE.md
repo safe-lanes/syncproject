@@ -279,6 +279,32 @@ If both sides have an `is_deleted`-shaped column:
 - **`ship_to_online`** (delete, `0→1`): same, **but only if** `target.updatedAt <= source.updatedAt`. This prevents propagating an old ship-side delete over a more recent online-side edit. (Bug 2 fix.)
 - **`online_to_ship`** (un-delete / restore, `1→0`): a row that is active online (`source.deleted=0`) but soft-deleted on the ship (`target.deleted=1`) is **restored on the ship**, **but only if** the table has a timestamp column AND `target.updatedAt <= source.updatedAt`. The timestamp guard ensures a more recent ship-side delete is never resurrected by a stale online row; without a timestamp column no restore happens (the row stays deleted). This is the only place the engine flips a delete flag back to `0`. There is intentionally **no** un-delete in `ship_to_online` — the online side's deleted state is authoritative and the ship cannot restore it.
 
+#### Business-key duplicate resolution (online wins)
+
+For tables with a configured `businessKeyColumn` (§Insert-missing dedup) **and** a
+soft-delete column on both sides, the engine resolves the case where the *same
+logical record* was independently created on both sides — same business key, but
+different auto-increment PKs. The online row is authoritative:
+
+- The **ship-originated duplicate is soft-deleted** (`0→1`) so it stops showing on
+  the ship. A ship row is retired only when an **active** online row shares its
+  business key **and** the ship row's PK does **not** exist on online (the
+  PK-absence guard guarantees the genuinely-synced canonical row is never retired,
+  and the engine stays conservative on any cross-side PK collision).
+- The hidden ship row then **propagates to online via the normal insert path**: a
+  soft-deleted source row is intentionally **not** suppressed by the business-key
+  dedup, so it inserts on the target as a deleted row. It never renders anywhere
+  (deleted), and both databases converge to the same set of rows (typically over
+  two runs: retire on run *n*, propagate on run *n+1*).
+- Tables **without** a configured business key are unaffected; active-row dedup
+  behavior is unchanged.
+
+> **NULL-key contract:** a row is only retired when **all** configured key columns
+> are non-NULL. An all-NULL business key is not a meaningful logical identity, and
+> NULL-safe equality (`<=>`) would otherwise treat empty keys as equal and
+> over-retire unrelated rows. Configure `businessKeyColumn` only on columns that
+> are reliably populated for the records you intend to dedup.
+
 ---
 
 ## 8. Performance design

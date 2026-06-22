@@ -31,6 +31,26 @@ resurrected by a stale online row. NULL/missing timestamps mean "don't restore"
 "go ahead". `ship_to_online` has no un-delete because the online side's deleted
 state is authoritative and the ship must not override it.
 
+## Business-key duplicate resolution (online wins)
+
+For tables that have BOTH a configured business key and a soft-delete column, the
+soft-delete step also retires a ship-originated duplicate when the same logical
+record was independently created on both sides (same business key, different
+auto-increment PKs):
+- Retire condition: ship row active, an *active* online row shares the business
+  key, AND no online row has the ship row's PK (PK-absence ⇒ ship-originated, so
+  the genuinely-synced canonical row is never retired; conservative on PK
+  collisions).
+- The retired (deleted) ship row is then allowed to propagate to online because a
+  soft-deleted *source* row is exempted from the insert business-key dedup — it
+  inserts on online as a deleted row and the DBs converge (usually two runs).
+- **NULL-key contract:** only retire when ALL configured key columns are non-NULL.
+  `<=>` treats NULL=NULL as equal, so an all-NULL key would over-retire unrelated
+  empty-key rows.
+**Why:** the user's stated policy — if online has the record, the ship's separate
+copy must stop showing; deleted rows never render, so syncing the deletion to
+online is harmless and keeps both sides consistent.
+
 **How to apply:** Any future change to delete-flag handling must stay inside the
 dedicated soft-delete step (do not re-add the flag to the field merge), and must
 keep the asymmetry above unless the product owner explicitly changes the

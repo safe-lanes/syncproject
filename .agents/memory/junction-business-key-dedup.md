@@ -23,10 +23,20 @@ override" and the table keeps the legacy behavior.
 2. Fallback (no configured key): the original auto-increment-PK + DB `UNIQUE`
    index heuristic. Tables without a business key behave exactly as before.
 
-**Why insert-only (scope 1):** this stops the duplicate *insert*. It does NOT fix
+**Insert-only scope:** the dedup stops the duplicate *insert*. It does NOT fix
 the deeper risk that the compare/merge step still joins by PK, so the same
 auto-increment id can map to different logical rows across sides — that requires
-matching the merge step by business key too (deferred phase 2).
+matching the merge step by business key too (still deferred).
+
+**Duplicate resolution when both sides already created the row** (online wins):
+for business-key tables that also have a soft-delete column, the soft-delete step
+retires the ship-originated duplicate (sets `is_deleted=1` on the ship) when an
+*active* online row shares the business key AND no online row has the ship row's
+PK (PK-absence = ship-originated; never retires the synced canonical row). The
+retired row then flows to online normally because a soft-deleted *source* row is
+intentionally exempted from the insert dedup — it lands on online as a deleted
+row (invisible) and the two DBs converge, usually over two runs. See
+soft-delete-semantics.md for the full contract.
 
 **Gotchas / rules:**
 - The column must exist in **both** config tables (`offline_sync_tables` AND
