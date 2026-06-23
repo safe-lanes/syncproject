@@ -379,7 +379,7 @@ WHERE column_name = 'your_new_metadata_col_here';
 
 ### B.4.2 Change the conflict policy from "online wins" to something else
 
-Today the engine implements only online-wins (first-sync and Case-5) plus empty-gap-fill. To add a real policy plug-in:
+Today the engine implements only LWW-on-first-sync and online-wins-on-Case-5. To add a real policy plug-in:
 
 1. Define the policy name as a constant in `Policies.cs`.
 2. Extend `Models.SyncRule` if you need parameters.
@@ -500,8 +500,9 @@ case  predicate                              action               new shadow
 FIRST SYNC (no shadow) PRIORITY
 1. equal values          → skip, write shadow=source
 2. one side empty        → non-empty wins (SHIP_FILLS_GAP/ONLINE_FILLS_GAP)
-3. both have data, differ → online wins (ONLINE_WINS)
-   (updatedAt is NOT consulted; no Last-Write-Wins fallback)
+3. both have updatedAt   → newer wins  (SHIP_NEWER/ONLINE_NEWER)
+4. only one has updatedAt → that side wins
+5. neither has updatedAt → online wins (ONLINE_DEFAULT)
 
 EXIT CODES
 0 success    1 runtime error    2 config error

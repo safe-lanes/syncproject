@@ -200,7 +200,7 @@ If the table is missing on either side, log warning and return zeros. Never atte
 
 `Db.GetTableMetaAsync` reads `information_schema.COLUMNS` to find:
 - the **primary key** (must exist; tables without PK are skipped)
-- an optional **`updatedAt`-style column** (used only for the soft-delete timestamp guard — never for field comparison or first-sync resolution)
+- an optional **`updatedAt`-style column** (used for first-sync LWW only — never for comparison)
 - whether the table has a soft-delete column (`is_deleted` / `isDeleted` / `deleted`)
 - the list of **comparable columns** = all non-PK columns minus the `SystemColumns` exclusion set
 
@@ -243,25 +243,19 @@ For each column in the intersection, the engine processes target rows in batches
 
 The `hasShadow` boolean splits behaviour into two sub-matrices.
 
-**A. First sync (`!hasShadow`)** — there is no baseline, so we cannot know who changed what. The rule is **gap-fill, then online-wins** (`SyncEngine.cs`):
+**A. First sync (`!hasShadow`)** — there is no baseline, so we cannot know who changed what. Use a Last-Write-Wins fallback hierarchy (`SyncEngine.cs:418–525`):
 
 ```
 1. sourceHash == targetHash               → already equal, write shadow=source, no update
 2. online empty + ship has data           → SHIP_FILLS_GAP (ship value wins)
 3. online has data + ship empty           → ONLINE_FILLS_GAP (online value wins)
-4. both have data, values differ          → ONLINE_WINS (online value wins)
+4. both have updatedAt                    → SHIP_NEWER if ship.updatedAt > online.updatedAt,
+                                             else ONLINE_NEWER
+5. only one has updatedAt                 → that side wins
+6. neither has updatedAt                  → ONLINE_DEFAULT (online wins)
 ```
 
-Branch 4 covers the case where a field was empty on both sides at the record's first
-sync and was then filled with **different** data on each side. There is no baseline to
-prove who edited what, but the contract is that a same-field, both-populated conflict
-always resolves to **online** — the same outcome as the subsequent-sync conflict rule
-(Case 5). This deliberately replaces the previous Last-Write-Wins (newer `updatedAt`
-wins) fallback, which could let a more-recent ship edit overwrite a populated online
-value and then propagate the ship value to both sides. The `updatedAt` column is no
-longer consulted during first-sync resolution.
-
-In ALL branches, the **shadow is set to the source value** (`Db.NormalizeValue(sval)`). This preserves the §6 invariant. Storing the *winner* here was the bug fixed as Bug 8 — when the winner was ship and the source was online, the next sync saw `source != shadow` and incorrectly fired Case 3.
+In ALL six branches, the **shadow is set to the source value** (`Db.NormalizeValue(sval)`). This preserves the §6 invariant. Storing the *winner* here was the bug fixed as Bug 8 — when the winner was ship and the source was online, the next sync saw `source != shadow` and incorrectly fired Case 3.
 
 **B. Subsequent sync (shadow exists)** — apply the 3-way decision (`SyncEngine.cs:528–641`):
 
@@ -425,7 +419,7 @@ These statements should be true at all times. If any is violated, sync correctne
 - **Hard deletes are not propagated.** Only soft deletes (via `is_deleted` flag) are. Rows that are physically `DELETE`d on one side will simply re-appear next sync (the insert-missing step will recreate them from the dump).
 - **No concurrent runs.** Two SyncConsole processes running against the same target DB simultaneously are not safe — both will read shadow, both will compute updates, the second one's shadow upserts may overwrite the first one's. Operators should guard against double invocation at the calling layer (typical: a single cron job or a backend-API queue).
 - **The 2-day dump window is a pipeline assumption, not an engine choice.** The engine will faithfully sync whatever is in the dump. If QA edits a record on Apr 1 and the dump runs on Apr 5, the record won't be in the dump and won't sync. This was the dominant cause of QA's "doesn't sync" reports.
-- **`Policies.cs` constants are not yet wired up.** Today the engine implements only empty-gap-fill + online-wins. Policy plumbing exists in the model layer (`Models.SyncRule`) but has no runtime path. Expanding to `numeric_add`, `set_union`, etc., is a future feature.
+- **`Policies.cs` constants are not yet wired up.** Today the engine implements only LWW + online-wins. Policy plumbing exists in the model layer (`Models.SyncRule`) but has no runtime path. Expanding to `numeric_add`, `set_union`, etc., is a future feature.
 
 ---
 
@@ -441,6 +435,6 @@ These statements should be true at all times. If any is violated, sync correctne
 | **First sync** | A (table, column, PK) row that has no shadow entry yet. |
 | **Subsequent sync** | A (table, column, PK) row that has a shadow entry. |
 | **Case 1–5** | The five branches of the subsequent-sync 3-way merge matrix. |
-| **LWW** | Last-Write-Wins (timestamp-based tiebreaker). Formerly the first-sync fallback; **no longer used** — first-sync now resolves by online-wins (see USAGE Bug 7 for history). |
+| **LWW** | Last-Write-Wins (timestamp-based tiebreaker, used in first-sync only). |
 | **Bug 6 / 7 / 8** | Documented historical regressions; see `CLAUDE.md` and the per-bug memory pages. |
 | **Dump window** | The `WHERE date(updatedAt) BETWEEN DATE_SUB(CURDATE(), INTERVAL N DAY) AND CURDATE()` filter applied by the cloud-side `mysqldump` script (typically N=2). |
