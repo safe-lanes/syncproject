@@ -1,3 +1,4 @@
 - [Soft-delete semantics](soft-delete-semantics.md) — directional delete/un-delete rules in SyncEngine; delete flag handled only by the dedicated step, un-delete is online→ship + timestamp-guarded.
 - [MySqlConnector CHAR(36) → Guid](mysqlconnector-guid-char36.md) — connection must set GuidFormat=None; CHAR(36) cols aren't always UUIDs and the driver throws parsing non-UUID values.
 - [Business-key dedup](junction-business-key-dedup.md) — optional businessKeyColumn JSON config dedups junction-table INSERTs by logical key; precedence over the unique-index heuristic; insert-only (merge still joins by PK).
+- [First-sync conflict resolution](firstsync-conflict-resolution.md) — no-baseline both-populated conflict now resolves online-wins (was Last-Write-Wins); updatedAt no longer used for field resolution; gap-fill preserved.

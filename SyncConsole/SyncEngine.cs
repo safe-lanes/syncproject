@@ -525,7 +525,7 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                 foreach (var kv in triples)
                     {
                         var pk = kv.Key;
-                        var (tval, sval, tts, sts) = kv.Value;
+                        var (tval, sval, _, _) = kv.Value;
 
                         // Compute hashes (NormalizeValue is called inside ComputeHash)
                         var sourceHash = Db.ComputeHash(sval);
@@ -586,14 +586,17 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                             // ════════════════════════════════════════════════════════════
                             // FIRST SYNC — No shadow baseline exists
                             //
-                            // Without shadow we can't do 3-way merge. Use these rules:
+                            // Without a shadow we can't do a true 3-way merge. Rules:
                             // 1. Values match → establish shadow, no update
-                            // 2. Both have timestamps → LAST WRITE WINS (newer timestamp wins)
-                            // 3. Only one has data → that side wins (SHIP_FILLS_GAP / ONLINE_WINS)
-                            // 4. No timestamps available → ONLINE wins (safe default)
+                            // 2. Only one side has data → that side fills the gap
+                            //    (SHIP_FILLS_GAP / ONLINE_FILLS_GAP)
+                            // 3. Both sides have data but differ → ONLINE wins
                             //
-                            // This ensures that if ship user edited more recently than online,
-                            // the ship edit is preserved on first sync.
+                            // This mirrors the subsequent-sync conflict rule (Case 5): a
+                            // same-field, both-populated conflict always resolves to online,
+                            // even without a baseline. Online's populated value is never
+                            // overwritten by a ship edit just because the ship was saved
+                            // more recently (the previous Last-Write-Wins behavior).
                             // ════════════════════════════════════════════════════════════
 
                             if (sourceHash == targetHash)
@@ -624,48 +627,17 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                                 winnerVal = onlineVal;
                                 winnerLabel = "ONLINE_FILLS_GAP";
                             }
-                            else if (sts.HasValue && tts.HasValue)
-                            {
-                                // BOTH have timestamps → LAST WRITE WINS
-                                var onlineTs = _direction == "ship_to_online" ? tts.Value : sts.Value;
-                                var shipTs = _direction == "ship_to_online" ? sts.Value : tts.Value;
-
-                                if (shipTs > onlineTs)
-                                {
-                                    // Ship edited MORE RECENTLY → ship wins
-                                    winnerVal = shipVal;
-                                    winnerLabel = "SHIP_NEWER";
-                                }
-                                else
-                                {
-                                    // Online edited more recently (or same time) → online wins
-                                    winnerVal = onlineVal;
-                                    winnerLabel = "ONLINE_NEWER";
-                                }
-
-                                _log.LogDebug("First sync LWW {Table}.{Col} PK={Pk}: " +
-                                    "onlineTs={OTs} shipTs={STs} → {Winner}",
-                                    table, col, pk, onlineTs, shipTs, winnerLabel);
-                            }
-                            else if (sts.HasValue && !tts.HasValue)
-                            {
-                                // Only source has timestamp → source wins
-                                var sourceIsOnline = (_direction == "online_to_ship");
-                                winnerVal = sourceIsOnline ? onlineVal : shipVal;
-                                winnerLabel = sourceIsOnline ? "ONLINE_HAS_TS" : "SHIP_HAS_TS";
-                            }
-                            else if (!sts.HasValue && tts.HasValue)
-                            {
-                                // Only target has timestamp → target wins
-                                var targetIsOnline = (_direction == "ship_to_online");
-                                winnerVal = targetIsOnline ? onlineVal : shipVal;
-                                winnerLabel = targetIsOnline ? "ONLINE_HAS_TS" : "SHIP_HAS_TS";
-                            }
                             else
                             {
-                                // No timestamps at all → online wins (safe default)
+                                // Both sides have data (neither empty) and the values
+                                // differ. No baseline exists to prove who changed what,
+                                // but the configured contract is that a same-field,
+                                // both-populated conflict always resolves in favor of
+                                // ONLINE — including on first sync. (Previously this used
+                                // Last-Write-Wins by timestamp, which let a more-recent
+                                // ship edit overwrite a populated online value.)
                                 winnerVal = onlineVal;
-                                winnerLabel = "ONLINE_DEFAULT";
+                                winnerLabel = "ONLINE_WINS";
                             }
 
                             var winnerHash = Db.ComputeHash(winnerVal);
