@@ -1,3 +1,4 @@
 - [Soft-delete semantics](soft-delete-semantics.md) — directional delete/un-delete rules in SyncEngine; delete flag handled only by the dedicated step, un-delete is online→ship + timestamp-guarded.
 - [MySqlConnector CHAR(36) → Guid](mysqlconnector-guid-char36.md) — connection must set GuidFormat=None; CHAR(36) cols aren't always UUIDs and the driver throws parsing non-UUID values.
 - [Business-key dedup](junction-business-key-dedup.md) — optional businessKeyColumn JSON config dedups junction-table INSERTs by logical key; precedence over the unique-index heuristic; insert-only (merge still joins by PK).
+- [Soft-delete column detection](soft-delete-column-detection.md) — recognized delete-column names live in TWO Db.cs spots that must stay in sync; an unrecognized name silently disables all delete handling for a table.

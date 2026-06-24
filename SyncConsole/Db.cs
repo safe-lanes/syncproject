@@ -37,7 +37,7 @@ public static class Db
     // ═══════════════════════════════════════════════════════════════════════
     public static readonly HashSet<string> DeleteColumnNames = new(StringComparer.OrdinalIgnoreCase)
     {
-        "is_deleted", "isdeleted", "deleted"
+        "is_deleted", "isdeleted", "isdelete", "deleted"
     };
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -858,7 +858,7 @@ public static class Db
             SELECT COLUMN_NAME
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA=@db AND TABLE_NAME=@table
-              AND LOWER(COLUMN_NAME) IN ('is_deleted','isdeleted','deleted')
+              AND LOWER(COLUMN_NAME) IN ('is_deleted','isdeleted','isdelete','deleted')
             LIMIT 1
             """, new { db, table });
         return col;
