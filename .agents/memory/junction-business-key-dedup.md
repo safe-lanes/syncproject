@@ -49,6 +49,19 @@ state is stable (no further inserts/retires on later runs). The exemption is sco
 to Precedence 1 only; the unique-index fallback (Precedence 2) is unchanged, and
 active-vs-active dedup still prevents the original duplicate-insert bug.
 
+**NULL-key handling (insert dedup):** the Precedence-1 anti-join uses NULL-safe
+`<=>`, which treats `NULL = NULL` as **equal** — so without a guard it wrongly
+collapses unrelated rows that merely share NULL key columns. The dedup therefore
+only fires when EVERY configured key column on the source row is non-NULL
+(`s.k IS NOT NULL AND …`); if any key column is NULL the row bypasses dedup and
+inserts. This mirrors the retirement step's existing all-key-NOT-NULL guard, so
+the two paths agree. Fully-populated keys are unaffected (identical to prior
+behavior). **Why:** `<=>` NULL=NULL matching silently suppressed good rows whose
+identity column (e.g. `masterId`) was NULL.
+**How to apply:** current rule is all-or-nothing (any NULL key col → skip dedup).
+A future enhancement (deferred) is a per-table `businessKeyNullableColumns` JSON
+list so only *designated* columns being NULL skip dedup; until then it's all keys.
+
 **Gotchas / rules:**
 - The column must exist in **both** config tables (`offline_sync_tables` AND
   `online_sync_tables`) to work in both directions; the loader probes

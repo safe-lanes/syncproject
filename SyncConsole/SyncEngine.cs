@@ -421,8 +421,18 @@ WHERE COALESCE(sh.`{shipDelCol}`, 0) = 0
                             ? ""
                             : $"COALESCE(s.`{srcDelCol}`, 0) = 1 OR ";
 
+                        // A source row whose configured key is not fully populated has
+                        // no meaningful logical identity, and `<=>` treats NULL=NULL as
+                        // equal — which would wrongly suppress unrelated NULL-key rows.
+                        // Mirror Step 1.5's retirement guard: only dedup when EVERY
+                        // configured key column on the source row is non-NULL. If any
+                        // key column is NULL the row is never deduped (it inserts).
+                        var bkNotNull = string.Join(" AND ",
+                            configKey.Select(k => $"s.`{k}` IS NOT NULL"));
+
                         bizKeyFilter = $@"
-  AND ({srcActiveGuard}NOT EXISTS (SELECT 1 FROM `{TargetDb}`.`{table}` ex WHERE {conditions}{tgtActiveFilter}))";
+  AND ({srcActiveGuard}NOT ({bkNotNull})
+       OR NOT EXISTS (SELECT 1 FROM `{TargetDb}`.`{table}` ex WHERE {conditions}{tgtActiveFilter}))";
                         _log.LogDebug("Business-key dedup (config) {Table}: [{Keys}]",
                             table, string.Join(",", configKey));
                     }
