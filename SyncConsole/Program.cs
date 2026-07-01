@@ -98,6 +98,12 @@ Example:
             => cli.TryGetValue(key, out var v) && int.TryParse(v, out var val) && val > 0 ? val : current;
 
         var seed = json ?? new Settings("", "", "", "", "", "ship_to_online", "online", 200, "Information");
+
+        //var seed = json ?? new Settings("Server=localhost;User Id=sailadmin;password=sailadmin;AllowUserVariables=true;", "rsms", "rsmsnew", "rsms", "9340415", "ship_to_online", "online", 200, "Information");
+
+        //online to ship
+        //var seed = json ?? new Settings("Server=localhost;User Id=sailadmin;password=sailadmin;AllowUserVariables=true;", "rsms", "rsmsnew", "rsms", "9340415", "online_to_ship", "ship", 200, "Information");
+
         return seed with
         {
             Connection = Get("connection", seed.Connection),
@@ -424,6 +430,8 @@ Example:
         finally
         {
             Log.CloseAndFlush();
+            //Console.WriteLine("\nPress any key to exit...");
+            //Console.ReadKey();
         }
     }
 }

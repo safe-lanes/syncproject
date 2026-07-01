@@ -598,12 +598,13 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                             //
                             // Without shadow we can't do 3-way merge. Use these rules:
                             // 1. Values match → establish shadow, no update
-                            // 2. Both have timestamps → LAST WRITE WINS (newer timestamp wins)
-                            // 3. Only one has data → that side wins (SHIP_FILLS_GAP / ONLINE_WINS)
-                            // 4. No timestamps available → ONLINE wins (safe default)
+                            // 2. Online empty, ship has data → ship fills gap
+                            // 3. Ship empty, online has data → online fills gap
+                            // 4. Both have data → ONLINE wins (unconditional)
                             //
-                            // This ensures that if ship user edited more recently than online,
-                            // the ship edit is preserved on first sync.
+                            // Rule 4 previously used LWW (last-write-wins) based on timestamps,
+                            // which let ship overwrite online when shipTs > onlineTs. This violates
+                            // the "online always wins" product invariant and caused values to swap.
                             // ════════════════════════════════════════════════════════════
 
                             if (sourceHash == targetHash)
@@ -634,48 +635,18 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                                 winnerVal = onlineVal;
                                 winnerLabel = "ONLINE_FILLS_GAP";
                             }
-                            else if (sts.HasValue && tts.HasValue)
-                            {
-                                // BOTH have timestamps → LAST WRITE WINS
-                                var onlineTs = _direction == "ship_to_online" ? tts.Value : sts.Value;
-                                var shipTs = _direction == "ship_to_online" ? sts.Value : tts.Value;
-
-                                if (shipTs > onlineTs)
-                                {
-                                    // Ship edited MORE RECENTLY → ship wins
-                                    winnerVal = shipVal;
-                                    winnerLabel = "SHIP_NEWER";
-                                }
-                                else
-                                {
-                                    // Online edited more recently (or same time) → online wins
-                                    winnerVal = onlineVal;
-                                    winnerLabel = "ONLINE_NEWER";
-                                }
-
-                                _log.LogDebug("First sync LWW {Table}.{Col} PK={Pk}: " +
-                                    "onlineTs={OTs} shipTs={STs} → {Winner}",
-                                    table, col, pk, onlineTs, shipTs, winnerLabel);
-                            }
-                            else if (sts.HasValue && !tts.HasValue)
-                            {
-                                // Only source has timestamp → source wins
-                                var sourceIsOnline = (_direction == "online_to_ship");
-                                winnerVal = sourceIsOnline ? onlineVal : shipVal;
-                                winnerLabel = sourceIsOnline ? "ONLINE_HAS_TS" : "SHIP_HAS_TS";
-                            }
-                            else if (!sts.HasValue && tts.HasValue)
-                            {
-                                // Only target has timestamp → target wins
-                                var targetIsOnline = (_direction == "ship_to_online");
-                                winnerVal = targetIsOnline ? onlineVal : shipVal;
-                                winnerLabel = targetIsOnline ? "ONLINE_HAS_TS" : "SHIP_HAS_TS";
-                            }
                             else
                             {
-                                // No timestamps at all → online wins (safe default)
+                                // Both sides have data → online always wins.
+                                // LWW (last-write-wins) based on timestamps was previously used here,
+                                // but it allowed ship to overwrite online when the ship timestamp was
+                                // more recent — violating the "online always wins" product invariant.
+                                // This happened on the FIRST run of a direction (no shadow yet), even
+                                // after the other direction had already synced and established data on
+                                // both sides. Online wins unconditionally; SHIP_FILLS_GAP (above) is
+                                // the only legitimate path for ship to win a first-sync decision.
                                 winnerVal = onlineVal;
-                                winnerLabel = "ONLINE_DEFAULT";
+                                winnerLabel = "ONLINE_WINS_FIRST_SYNC";
                             }
 
                             var winnerHash = Db.ComputeHash(winnerVal);
