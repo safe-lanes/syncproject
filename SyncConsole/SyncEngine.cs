@@ -661,7 +661,8 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                             // overwriting the ship's preserved edit. Storing source value preserves
                             // the invariant `shadow == last-seen source`, so subsequent syncs see
                             // Case 1 (online won → all equal) or Case 2 (ship won → only target changed → preserve).
-                            toShadow.Add((pk, Db.NormalizeValue(sval)));
+                            //toShadow.Add((pk, Db.NormalizeValue(sval)));
+                            toShadow.Add((pk, Db.NormalizeValue(winnerVal)));
 
                             _log.LogDebug("First sync {Table}.{Col} PK={Pk}: {Policy} " +
                                 "(online={OnlineVal}, ship={ShipVal})",
@@ -783,7 +784,8 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                             // When CONFLICT_SHIP_FILLS_GAP keeps ship's value (winner != source),
                             // we must NOT store winner here or the next sync will see source!=shadow
                             // and fire Case 3 PROPAGATE, wiping the just-preserved ship value.
-                            toShadow.Add((pk, Db.NormalizeValue(sval)));
+                            //toShadow.Add((pk, Db.NormalizeValue(sval)));
+                            toShadow.Add((pk, Db.NormalizeValue(winnerValue)));
                             continue;
                         }
                     }
