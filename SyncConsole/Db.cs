@@ -1,4 +1,4 @@
-﻿using System.Data;
+﻿﻿using System.Data;
 using Dapper;
 using Microsoft.Extensions.Logging;
 using MySqlConnector;
@@ -1150,7 +1150,8 @@ ON DUPLICATE KEY UPDATE
         string column,
         string pkColumn,
         IEnumerable<(string pk, object? value)> updates,
-        ILogger? log = null)
+        ILogger? log = null,
+        ICollection<string>? failedPks = null)
     {
         var list = updates.ToList();
         if (list.Count == 0) return 0;
@@ -1213,7 +1214,7 @@ ON DUPLICATE KEY UPDATE
             log?.LogWarning("Bulk update failed for {Table}.{Column}: {Error} - using fallback",
                 table, column, ex.Message);
 
-            return await SafeUpdateColumnAsync(conn, targetDb, table, column, pkColumn, list, log);
+            return await SafeUpdateColumnAsync(conn, targetDb, table, column, pkColumn, list, log, failedPks);
         }
         finally
         {
@@ -1239,7 +1240,8 @@ ON DUPLICATE KEY UPDATE
         string column,
         string pkColumn,
         IEnumerable<(string pk, object? value)> updates,
-        ILogger? log = null)
+        ILogger? log = null,
+        ICollection<string>? failedPks = null)
     {
         var list = updates.ToList();
         if (list.Count == 0) return 0;
@@ -1277,11 +1279,108 @@ ON DUPLICATE KEY UPDATE
 
             return affected;
         }
+        catch (MySqlException ex) when (IsRowLevelDataError(ex))
+        {
+            // LAST RESORT: the whole-batch CASE-WHEN failed on a ROW-LEVEL data
+            // error (e.g. one row's new value collides with a UNIQUE index held
+            // by another row). Degrade to row-by-row updates so ONLY the
+            // offending row(s) are skipped — the rest of the batch still syncs.
+            // Skipped PKs are reported via failedPks so the caller can keep
+            // them out of the shadow baseline (they will be retried and
+            // re-logged on every run until fixed).
+            //
+            // Systemic errors (lost connection, deadlock, server gone away…)
+            // deliberately do NOT enter this path: they are not row problems,
+            // and swallowing them per-row would silently convert an
+            // infrastructure failure into hundreds of "skipped" rows. Those
+            // still propagate to the caller.
+            log?.LogWarning(ex,
+                "⚠️ Fallback CASE-WHEN update failed for {Table}.{Column}: {Error} — retrying row-by-row",
+                table, column, ex.Message);
+
+            return await PerRowUpdateColumnAsync(conn, targetDb, table, column, pkColumn, list, log, failedPks);
+        }
         catch (Exception ex)
         {
             log?.LogError(ex, "❌ Fallback update failed for {Table}.{Column}", table, column);
             throw;
         }
+    }
+
+    /// <summary>
+    /// True for MySQL errors caused by the DATA of a specific row (safe to skip
+    /// that row and continue); false for systemic/connection/lock errors that
+    /// must propagate.
+    /// </summary>
+    private static bool IsRowLevelDataError(MySqlException ex)
+    {
+        return ex.Number switch
+        {
+            1062 => true,  // Duplicate entry (UNIQUE index collision)
+            1048 => true,  // Column cannot be null
+            1406 => true,  // Data too long for column
+            1264 => true,  // Out of range value
+            1292 => true,  // Incorrect (datetime) value
+            1366 => true,  // Incorrect string/integer value for column
+            1452 => true,  // FK constraint fails (row references missing parent)
+            3819 => true,  // CHECK constraint violated
+            _ => false
+        };
+    }
+
+    /// <summary>
+    /// Final fallback: update rows one at a time, skipping (and reporting) any
+    /// row whose UPDATE fails — e.g. a duplicate-key collision on a UNIQUE
+    /// index. Never throws for a single bad row; the rest of the batch syncs.
+    /// </summary>
+    private static async Task<int> PerRowUpdateColumnAsync(
+        MySqlConnection conn,
+        string targetDb,
+        string table,
+        string column,
+        string pkColumn,
+        List<(string pk, object? value)> list,
+        ILogger? log,
+        ICollection<string>? failedPks)
+    {
+        int affected = 0;
+        int skipped = 0;
+
+        foreach (var (pk, value) in list)
+        {
+            try
+            {
+                var normalized = (value == null || value is DBNull) ? null : NormalizeValue(value);
+                affected += await conn.ExecuteAsync(
+                    $"UPDATE `{targetDb}`.`{table}` SET `{column}` = @val WHERE `{pkColumn}` = @pk",
+                    new { val = normalized, pk });
+            }
+            catch (MySqlException rowEx) when (IsRowLevelDataError(rowEx))
+            {
+                // Only genuine per-row data conflicts are skipped. Connection
+                // loss, deadlocks and other systemic errors propagate — they
+                // would otherwise be silently converted into mass row skips.
+                skipped++;
+                failedPks?.Add(pk);
+                log?.LogWarning(
+                    "⚠️ SKIPPED row: {Table}.{Column} PK={Pk} could not be updated: {Error}",
+                    table, column, pk, rowEx.Message);
+            }
+        }
+
+        if (skipped > 0)
+        {
+            log?.LogWarning(
+                "⚠️ Row-by-row update for {Table}.{Column}: {Affected} updated, {Skipped} row(s) SKIPPED (will retry next run)",
+                table, column, affected, skipped);
+        }
+        else
+        {
+            log?.LogInformation("✓ Row-by-row update completed: {Affected}/{Total} rows",
+                affected, list.Count);
+        }
+
+        return affected;
     }
     /// <summary>
     /// Check if a MySQL exception is transient (retryable)

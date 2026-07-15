@@ -654,15 +654,7 @@ JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`;";
                             {
                                 toUpdate.Add((pk, winnerVal));
                             }
-                            // BUG 8 FIX: Shadow tracks "last-seen source value", NOT the winner.
-                            // Previously shadow=winnerVal caused convergence revert on the next sync
-                            // when SHIP won LWW: shadow=ship_val while source still held online_val,
-                            // making the next pass see source!=shadow and fire Case 3 PROPAGATE,
-                            // overwriting the ship's preserved edit. Storing source value preserves
-                            // the invariant `shadow == last-seen source`, so subsequent syncs see
-                            // Case 1 (online won → all equal) or Case 2 (ship won → only target changed → preserve).
-                            //toShadow.Add((pk, Db.NormalizeValue(sval)));
-                            toShadow.Add((pk, Db.NormalizeValue(winnerVal)));
+                            toShadow.Add((pk, Db.NormalizeValue(sval)));
 
                             _log.LogDebug("First sync {Table}.{Col} PK={Pk}: {Policy} " +
                                 "(online={OnlineVal}, ship={ShipVal})",
