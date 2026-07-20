@@ -921,7 +921,9 @@ UPDATE `{TargetDb}`.`{table}` t
 JOIN `{SourceDb}`.`{table}` s ON s.`{meta.Pk}` = t.`{meta.Pk}`
 SET t.`{localDelCol}` = 0
 WHERE COALESCE(s.`{sourceDelCol}`, 0) = 0
-  AND COALESCE(t.`{localDelCol}`, 0) = 1;";
+  AND COALESCE(t.`{localDelCol}`, 0) = 1
+  AND (t.`{meta.UpdatedCol}` IS NULL OR s.`{meta.UpdatedCol}` IS NULL
+       OR t.`{meta.UpdatedCol}` <= s.`{meta.UpdatedCol}`);";
 
                             var undelCount = await _conn.ExecuteAsync(sqlUndel);
 
